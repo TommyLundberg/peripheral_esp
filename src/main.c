@@ -5,6 +5,8 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <pm/pm.h>  
+#include <device.h> 
 
 #include <stdbool.h>
 #include <zephyr/types.h>
@@ -13,7 +15,6 @@
 #include <errno.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/byteorder.h>
-#include <zephyr/zephyr.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -22,36 +23,123 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/services/bas.h>
 
+#include <zephyr/zephyr.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/sensor.h>
+#include <stdio.h>
+#include <zephyr/drivers/sensor/sht4x.h>
+
+#include <zephyr/kernel.h>
+#include <drivers/adc.h>
+#include <hal/nrf_saadc.h>
+#include <zephyr/drivers/gpio.h>
+
 #define SENSOR_1_NAME				"Temperature Sensor 1"
-#define SENSOR_2_NAME				"Temperature Sensor 2"
-#define SENSOR_3_NAME				"Humidity Sensor"
+#define SENSOR_3_NAME				"Humidity Sensor 1"
+#define SENSOR_4_NAME				"Soil Moisture Sensor"
 
 /* Sensor Internal Update Interval [seconds] */
-#define SENSOR_1_UPDATE_IVAL			5
-#define SENSOR_2_UPDATE_IVAL			12
-#define SENSOR_3_UPDATE_IVAL			60
+#define SENSOR_1_UPDATE_IVAL				60
+#define SENSOR_3_UPDATE_IVAL				60
+#define SENSOR_4_UPDATE_IVAL				60
 
 /* ESS error definitions */
-#define ESS_ERR_WRITE_REJECT			0x80
-#define ESS_ERR_COND_NOT_SUPP			0x81
+#define ESS_ERR_WRITE_REJECT				0x80
+#define ESS_ERR_COND_NOT_SUPP				0x81
 
 /* ESS Trigger Setting conditions */
-#define ESS_TRIGGER_INACTIVE			0x00
-#define ESS_FIXED_TIME_INTERVAL			0x01
+#define ESS_TRIGGER_INACTIVE				0x00
+#define ESS_FIXED_TIME_INTERVAL				0x01
 #define ESS_NO_LESS_THAN_SPECIFIED_TIME		0x02
-#define ESS_VALUE_CHANGED			0x03
-#define ESS_LESS_THAN_REF_VALUE			0x04
+#define ESS_VALUE_CHANGED					0x03
+#define ESS_LESS_THAN_REF_VALUE				0x04
 #define ESS_LESS_OR_EQUAL_TO_REF_VALUE		0x05
-#define ESS_GREATER_THAN_REF_VALUE		0x06
+#define ESS_GREATER_THAN_REF_VALUE			0x06
 #define ESS_GREATER_OR_EQUAL_TO_REF_VALUE	0x07
-#define ESS_EQUAL_TO_REF_VALUE			0x08
-#define ESS_NOT_EQUAL_TO_REF_VALUE		0x09
+#define ESS_EQUAL_TO_REF_VALUE				0x08
+#define ESS_NOT_EQUAL_TO_REF_VALUE			0x09
+
+#if !DT_HAS_COMPAT_STATUS_OKAY(sensirion_sht4x)
+#error "No sensirion,sht4x compatible node found in the device tree"
+#endif
+
+const struct device *adc_dev;
+#define ADC_DEVICE_NAME DT_ADC_0_NAME
+#define ADC_RESOLUTION 12
+#define ADC_GAIN ADC_GAIN_1_5
+#define ADC_REFERENCE ADC_REF_INTERNAL
+#define ADC_ACQUISITION_TIME ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)
+#define ADC_1ST_CHANNEL_ID 0
+#define ADC_1ST_CHANNEL_INPUT NRF_SAADC_INPUT_AIN0
+
+
+
+static const struct adc_channel_cfg m_1st_channel_cfg = {
+	.gain = ADC_GAIN,
+	.reference = ADC_REFERENCE,
+	.acquisition_time = ADC_ACQUISITION_TIME,
+	.channel_id = ADC_1ST_CHANNEL_ID,
+#if defined(CONFIG_ADC_CONFIGURABLE_INPUTS)
+	.input_positive = ADC_1ST_CHANNEL_INPUT,
+#endif
+};
+
+#define BUFFER_SIZE 8
+static int16_t m_sample_buffer[BUFFER_SIZE];
+static int16_t sum = 0;
+static float adc_val_bt;
+const struct adc_sequence_options sequence_opts = {
+	.interval_us = 0,
+	.callback = NULL,
+	.user_data = NULL,
+	.extra_samplings = 7,
+};
+
+static int adc_sample(float *adc_val_out)
+{
+	int ret;
+
+	const struct adc_sequence sequence = {
+		.options = &sequence_opts,
+		.channels = BIT(ADC_1ST_CHANNEL_ID),
+		.buffer = m_sample_buffer,
+		.buffer_size = sizeof(m_sample_buffer),
+		.resolution = ADC_RESOLUTION,
+	};
+
+	if (!adc_dev) {
+		return -1;
+	}
+
+	ret = adc_read(adc_dev, &sequence);
+	//printk("ADC read err: %d\n", ret);
+	sum = 0;
+	
+	//printk("ADC raw value: ");
+	for (int i = 0; i < BUFFER_SIZE; i++) {
+		printk("%d ", m_sample_buffer[i]);
+		sum = sum + m_sample_buffer[i];
+	}
+	
+	//printf("\n Measured voltage: ");
+		float adc_voltage = 0;
+		adc_voltage = (float)(((float)sum / (8*4095.0f)) *
+				      (0.6*5));
+		printk("%f ",adc_voltage);
+	
+	//printk("\n");
+	
+	*adc_val_out=adc_voltage;
+	return ret;
+}
+
 
 static ssize_t read_u16(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			void *buf, uint16_t len, uint16_t offset)
 {
 	const uint16_t *u16 = attr->user_data;
 	uint16_t value = sys_cpu_to_le16(*u16);
+	
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &value,
 				 sizeof(value));
@@ -104,23 +192,20 @@ static struct temperature_sensor sensor_1 = {
 		.meas.meas_uncertainty = 0x04,
 };
 
-static struct temperature_sensor sensor_2 = {
-		.temp_value = 1800,
-		.lower_limit = -1000,
-		.upper_limit = 5000,
-		.condition = ESS_VALUE_CHANGED,
-		.meas.sampling_func = 0x00,
-		.meas.meas_period = 0x01,
-		.meas.update_interval = SENSOR_2_UPDATE_IVAL,
-		.meas.application = 0x1b,
-		.meas.meas_uncertainty = 0x04,
-};
-
 static struct humidity_sensor sensor_3 = {
 		.humid_value = 6233,
 		.meas.sampling_func = 0x02,
 		.meas.meas_period = 0x0e10,
 		.meas.update_interval = SENSOR_3_UPDATE_IVAL,
+		.meas.application = 0x1c,
+		.meas.meas_uncertainty = 0x01,
+};
+
+static struct humidity_sensor sensor_4 = {
+		.humid_value = 6233,
+		.meas.sampling_func = 0x02,
+		.meas.meas_period = 0x0e10,
+		.meas.update_interval = SENSOR_4_UPDATE_IVAL,
 		.meas.application = 0x1c,
 		.meas.meas_uncertainty = 0x01,
 };
@@ -172,7 +257,7 @@ static ssize_t read_temp_valid_range(struct bt_conn *conn,
 
 struct es_trigger_setting_seconds {
 	uint8_t condition;
-	uint8_t sec[3];
+	uint8_t sec[60];
 } __packed;
 
 struct es_trigger_setting_reference {
@@ -250,7 +335,7 @@ static bool check_condition(uint8_t condition, int16_t old_val, int16_t new_val,
 }
 
 static void update_temperature(struct bt_conn *conn,
-			       const struct bt_gatt_attr *chrc, int16_t value,
+			       const struct bt_gatt_attr *chrc, double value,
 			       struct temperature_sensor *sensor)
 {
 	bool notify = check_condition(sensor->condition,
@@ -287,77 +372,43 @@ BT_GATT_SERVICE_DEFINE(ess_svc,
 	BT_GATT_CCC(temp_ccc_cfg_changed,
 		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 
-	/* Temperature Sensor 2 */
-	BT_GATT_CHARACTERISTIC(BT_UUID_TEMPERATURE,
-			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-			       BT_GATT_PERM_READ,
-			       read_u16, NULL, &sensor_2.temp_value),
-	BT_GATT_DESCRIPTOR(BT_UUID_ES_MEASUREMENT, BT_GATT_PERM_READ,
-			   read_es_measurement, NULL, &sensor_2.meas),
-	BT_GATT_CUD(SENSOR_2_NAME, BT_GATT_PERM_READ),
-	BT_GATT_DESCRIPTOR(BT_UUID_VALID_RANGE, BT_GATT_PERM_READ,
-			   read_temp_valid_range, NULL, &sensor_2),
-	BT_GATT_DESCRIPTOR(BT_UUID_ES_TRIGGER_SETTING,
-			   BT_GATT_PERM_READ, read_temp_trigger_setting,
-			   NULL, &sensor_2),
-	BT_GATT_CCC(temp_ccc_cfg_changed,
-		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
-
 	/* Humidity Sensor */
-	BT_GATT_CHARACTERISTIC(BT_UUID_HUMIDITY, BT_GATT_CHRC_READ,
+	BT_GATT_CHARACTERISTIC(BT_UUID_HUMIDITY, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_READ,
 			       read_u16, NULL, &sensor_3.humid_value),
 	BT_GATT_CUD(SENSOR_3_NAME, BT_GATT_PERM_READ),
 	BT_GATT_DESCRIPTOR(BT_UUID_ES_MEASUREMENT, BT_GATT_PERM_READ,
 			   read_es_measurement, NULL, &sensor_3.meas),
+
+	/* Soil Moisture Sensor */
+	BT_GATT_CHARACTERISTIC(BT_UUID_HUMIDITY, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ,
+			       read_u16, NULL, &sensor_4.humid_value),
+	BT_GATT_CUD(SENSOR_3_NAME, BT_GATT_PERM_READ),
+	BT_GATT_DESCRIPTOR(BT_UUID_ES_MEASUREMENT, BT_GATT_PERM_READ,
+			   read_es_measurement, NULL, &sensor_4.meas),
 );
-
-static void ess_simulate(void)
-{
-	static uint8_t i;
-	uint16_t val;
-
-	if (!(i % SENSOR_1_UPDATE_IVAL)) {
-		val = 1200 + i;
-		update_temperature(NULL, &ess_svc.attrs[2], val, &sensor_1);
-	}
-
-	if (!(i % SENSOR_2_UPDATE_IVAL)) {
-		val = 1800 + i;
-		update_temperature(NULL, &ess_svc.attrs[9], val, &sensor_2);
-	}
-
-	if (!(i % SENSOR_3_UPDATE_IVAL)) {
-		sensor_3.humid_value = 6233 + (i % 13);
-	}
-
-	if (!(i % INT8_MAX)) {
-		i = 0U;
-	}
-
-	i++;
-}
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE, 0x00, 0x03),
 	BT_DATA_BYTES(BT_DATA_UUID16_ALL,
-		      BT_UUID_16_ENCODE(BT_UUID_ESS_VAL),
-		      BT_UUID_16_ENCODE(BT_UUID_BAS_VAL)),
+		      BT_UUID_16_ENCODE(BT_UUID_ESS_VAL)
+		      ),
 };
 
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) {
-		printk("Connection failed (err 0x%02x)\n", err);
+		//printk("Connection failed (err 0x%02x)\n", err);
 	} else {
-		printk("Connected\n");
+		//printk("Connected\n");
 	}
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	printk("Disconnected (reason 0x%02x)\n", reason);
+	//printk("Disconnected (reason 0x%02x)\n", reason);
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -369,11 +420,11 @@ static void bt_ready(void)
 {
 	int err;
 
-	printk("Bluetooth initialized\n");
+	//printk("Bluetooth initialized\n");
 
 	err = bt_le_adv_start(BT_LE_ADV_CONN_NAME, ad, ARRAY_SIZE(ad), NULL, 0);
 	if (err) {
-		printk("Advertising failed to start (err %d)\n", err);
+		//printk("Advertising failed to start (err %d)\n", err);
 		return;
 	}
 
@@ -386,7 +437,7 @@ static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-	printk("Passkey for %s: %06u\n", addr, passkey);
+	//printk("Passkey for %s: %06u\n", addr, passkey);
 }
 
 static void auth_cancel(struct bt_conn *conn)
@@ -395,7 +446,7 @@ static void auth_cancel(struct bt_conn *conn)
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-	printk("Pairing cancelled: %s\n", addr);
+	//printk("Pairing cancelled: %s\n", addr);
 }
 
 static struct bt_conn_auth_cb auth_cb_display = {
@@ -404,26 +455,21 @@ static struct bt_conn_auth_cb auth_cb_display = {
 	.cancel = auth_cancel,
 };
 
-static void bas_notify(void)
-{
-	uint8_t battery_level = bt_bas_get_battery_level();
-
-	battery_level--;
-
-	if (!battery_level) {
-		battery_level = 100U;
-	}
-
-	bt_bas_set_battery_level(battery_level);
-}
-
 void main(void)
 {
 	int err;
+	struct gpio_dt_spec gpio_dev = GPIO_DT_SPEC_GET(DT_NODELABEL(sen0), gpios);
+	if (!device_is_ready(gpio_dev.port)) {
+		//printk("gpio not ready");
+	return;
+	}
+	gpio_pin_configure_dt(&gpio_dev, GPIO_OUTPUT | GPIO_ACTIVE_HIGH);
+
+
 
 	err = bt_enable(NULL);
 	if (err) {
-		printk("Bluetooth init failed (err %d)\n", err);
+		//printk("Bluetooth init failed (err %d)\n", err);
 		return;
 	}
 
@@ -431,15 +477,90 @@ void main(void)
 
 	bt_conn_auth_cb_register(&auth_cb_display);
 
-	while (1) {
-		k_sleep(K_SECONDS(1));
+	const struct device *sht = DEVICE_DT_GET_ANY(sensirion_sht4x);
+	struct sensor_value temp, hum;
 
-		/* Temperature simulation */
-		if (simulate_temp) {
-			ess_simulate();
+	
+	//printk("nRF53 SAADC sampling AIN0 (A04)\n");
+	adc_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
+	if (!adc_dev) {
+		//printk("device_get_binding ADC failed\n");
+	}
+	err = adc_channel_setup(adc_dev, &m_1st_channel_cfg);
+	if (err) {
+		//printk("Error in adc setup: %d\n", err);
+	}	
+	
+	while (true) {
+
+		gpio_pin_set_dt(&gpio_dev, 1);
+	
+		if (!device_is_ready(sht)) {
+		//printk("Device %s is not ready.\n", sht->name);
+		return;
 		}
 
-		/* Battery level simulation */
-		bas_notify();
+		#if CONFIG_APP_USE_HEATER
+			struct sensor_value heater_p;
+			struct sensor_value heater_d;
+
+			heater_p.val1 = CONFIG_APP_HEATER_PULSE_POWER;
+			heater_d.val1 = CONFIG_APP_HEATER_PULSE_DURATION;
+			sensor_attr_set(sht, SENSOR_CHAN_ALL,
+					SENSOR_ATTR_SHT4X_HEATER_POWER, &heater_p);
+			sensor_attr_set(sht, SENSOR_CHAN_ALL,
+					SENSOR_ATTR_SHT4X_HEATER_DURATION, &heater_d);
+		#endif
+
+		while (sensor_sample_fetch(sht)) {
+			//printk("Waiting to fetch sample from SHT4X device\n");
+		}
+		//printk("Successfully fetched sample from SHT4 device\n");
+		sensor_channel_get(sht, SENSOR_CHAN_AMBIENT_TEMP, &temp);
+		sensor_channel_get(sht, SENSOR_CHAN_HUMIDITY, &hum);
+		#if CONFIG_APP_USE_HEATER
+		/*
+		 * Conditions in which it makes sense to activate the heater
+		 * are application/environment specific.
+		 *
+		 * The heater should not be used above SHT4X_HEATER_MAX_TEMP (65 °C)
+		 * as stated in the datasheet.
+		 *
+		 * The temperature data will not be updated here for obvious reasons.
+		 **/
+		if (hum.val1 > CONFIG_APP_HEATER_HUMIDITY_THRESH &&
+				temp.val1 < SHT4X_HEATER_MAX_TEMP) {
+			printf("Activating heater.\n");
+
+			if (sht4x_fetch_with_heater(sht)) {
+				printf("Failed to fetch sample from SHT4X device\n");
+				return;
+			}
+
+			sensor_channel_get(sht, SENSOR_CHAN_HUMIDITY, &hum);
+		}
+		#endif
+
+
+		/*printk("SHT4X: %f Temp. [C] ; %f RH [%%] \n",
+		       (float)(sensor_value_to_double(&temp)),
+		       (float)(sensor_value_to_double(&hum)));*/
+
+		
+		err = adc_sample(&adc_val_bt);
+		//if (err==(-1)) {
+			//printk("Error in adc sampling: %d\n", err);
+		//}
+
+		int16_t val = (int16_t)100*(sensor_value_to_double(&temp));
+		int16_t hum_val = (int16_t)100*(sensor_value_to_double(&hum));
+		update_temperature(NULL, &ess_svc.attrs[2], val, &sensor_1);
+		sensor_3.humid_value = hum_val;
+		sensor_4.humid_value = (int16_t)(100*adc_val_bt);
+		
+		gpio_pin_set_dt(&gpio_dev, 0);
+
+		
+		k_sleep(K_SECONDS(60));
 	}
 }
