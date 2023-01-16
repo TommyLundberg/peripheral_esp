@@ -128,7 +128,7 @@ static int adc_sample(int adc_gain_inv, uint16_t *adc_val_out)
 	
 	//printf("\n Measured voltage: ");
 	int32_t adc_voltage = 0;
-	adc_voltage = ((adc_sum * 75 * adc_gain_inv) >> 12);
+	adc_voltage = ((adc_sum * 750 * adc_gain_inv) >> 12);
 	
 	//printk("\n");
 	*adc_val_out = (uint16_t)adc_voltage;
@@ -514,7 +514,7 @@ void main(void)
 	while (true) 
 	{
 		gpio_pin_set_dt(&gpio_dev, 1);
-	
+		k_sleep(K_MSEC(100));
 		if (!device_is_ready(sht)) 
 		{
 			return;
@@ -575,7 +575,7 @@ void main(void)
 		int16_t bt_hum_val = (int16_t)100*(sensor_value_to_double(&hum));
 		update_temperature(NULL, &ess_svc.attrs[2], bt_tmp_val, &sensor_1);
 		sensor_3.humid_value = bt_hum_val;
-		sensor_4.humid_value = (int16_t)(adc_val_bt/30);
+		sensor_4.humid_value = (int16_t)(adc_val_bt / 3);
 		gpio_pin_set_dt(&gpio_dev, 0);
 
 		k_sleep(K_SECONDS(60));
